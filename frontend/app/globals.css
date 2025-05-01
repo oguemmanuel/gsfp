@@ -1,0 +1,9 @@
+@import "tailwindcss";
+
+@plugin "tailwindcss-animate";
+
+.bg_radius{
+   border-top-left-radius: 10rem;
+   border-bottom-right-radius: 10rem;
+}
+
