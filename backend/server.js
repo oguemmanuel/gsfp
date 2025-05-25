@@ -6,7 +6,7 @@ const session = require("express-session");
 const MySQLStore = require("express-mysql-session")(session);
 const { db, Connection } = require("./db");
 const { router: authRoutes, requireAuth, requireAdmin, requireAdminSurveyAccess } = require("./auth");
-const bcrypt = require("bcryptjs");
+const bcrypt = require("bcrypt");
 const PDFDocument = require('pdfkit');
 const { ChartJSNodeCanvas } = require('chartjs-node-canvas');
 
