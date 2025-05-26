@@ -1,9 +1,7 @@
 "use client"
 
 import { useState, useEffect } from "react"
-import { RefreshCw } from "lucide-react"
-import { Button } from "@/components/ui/button"
-import { Alert, AlertDescription } from "@/components/ui/alert"
+import { RefreshCw, CheckCircle, AlertCircle } from "lucide-react"
 
 export default function SurveySection({ role, questions, onRefresh, isLoading }) {
   const [surveyResponses, setSurveyResponses] = useState({})
@@ -11,6 +9,7 @@ export default function SurveySection({ role, questions, onRefresh, isLoading })
   const [submitting, setSubmitting] = useState(false)
   const [errorMessage, setErrorMessage] = useState("")
   const [refreshing, setRefreshing] = useState(false)
+  const [successMessage, setSuccessMessage] = useState("")
 
   // Initialize survey responses when questions change
   useEffect(() => {
@@ -28,14 +27,21 @@ export default function SurveySection({ role, questions, onRefresh, isLoading })
       ...prev,
       [questionId]: response,
     }))
+    // Clear error message when user starts answering
+    if (errorMessage) {
+      setErrorMessage("")
+    }
   }
 
   const handleRefresh = async () => {
     setRefreshing(true)
     try {
       await onRefresh()
+      setSuccessMessage("Questions refreshed successfully!")
+      setTimeout(() => setSuccessMessage(""), 3000)
     } catch (error) {
       console.error("Error refreshing survey questions:", error)
+      setErrorMessage("Failed to refresh questions. Please try again.")
     } finally {
       setRefreshing(false)
     }
@@ -62,13 +68,22 @@ export default function SurveySection({ role, questions, onRefresh, isLoading })
           "Content-Type": "application/json",
         },
         credentials: "include",
-        body: JSON.stringify({ responses: surveyResponses }),
+        body: JSON.stringify(surveyResponses),
       })
 
       const data = await response.json()
 
       if (response.ok && data.success) {
         setSurveySubmitted(true)
+        setSuccessMessage("Survey submitted successfully! Thank you for your feedback.")
+
+        // Reset form after successful submission
+        setSurveyResponses({})
+
+        // Auto-hide success message after 5 seconds
+        setTimeout(() => {
+          setSuccessMessage("")
+        }, 5000)
       } else {
         setErrorMessage(data.message || "Failed to submit survey. Please try again.")
       }
@@ -83,113 +98,140 @@ export default function SurveySection({ role, questions, onRefresh, isLoading })
   const roleTitle = role.charAt(0).toUpperCase() + role.slice(1)
 
   return (
-    <div className="mb-10 bg-blue-50 shadow overflow-hidden sm:rounded-lg">
-      <div className="px-4 py-5 sm:px-6 bg-blue-100 flex justify-between items-center">
-        <div>
-          <h3 className="text-lg leading-6 font-medium text-blue-900">{roleTitle} Survey Questions</h3>
-          <p className="mt-1 max-w-2xl text-sm text-blue-700">
-            Your feedback is essential for improving the program. This information will be shared with the District
-            Director.
-          </p>
+    <div className="mb-8 bg-white shadow-lg rounded-lg overflow-hidden">
+      <div className="px-6 py-4 bg-gradient-to-r from-blue-500 to-green-500 text-white">
+        <div className="flex justify-between items-center">
+          <div>
+            <h3 className="text-lg font-semibold">{roleTitle} Survey</h3>
+            <p className="text-blue-100 text-sm">Your feedback helps improve the school feeding program</p>
+          </div>
+          {!surveySubmitted && (
+            <button
+              onClick={handleRefresh}
+              disabled={refreshing || isLoading}
+              className="bg-white bg-opacity-20 hover:bg-opacity-30 text-white px-3 py-2 rounded-md text-sm font-medium transition-all duration-200 flex items-center space-x-2"
+            >
+              <RefreshCw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
+              <span>Refresh</span>
+            </button>
+          )}
         </div>
-        {!surveySubmitted && (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={handleRefresh}
-            disabled={refreshing || isLoading}
-            className="bg-white hover:bg-gray-100"
-          >
-            <RefreshCw className={`h-4 w-4 mr-2 ${refreshing ? "animate-spin" : ""}`} />
-            Refresh
-          </Button>
-        )}
       </div>
 
-      {surveySubmitted ? (
-        <div className="px-4 py-5 sm:p-6 text-center">
-          <div className="mx-auto flex items-center justify-center h-12 w-12 rounded-full bg-green-100">
-            <svg
-              className="h-6 w-6 text-green-600"
-              xmlns="http://www.w3.org/2000/svg"
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-            >
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M5 13l4 4L19 7" />
-            </svg>
+      {/* Success Message */}
+      {successMessage && (
+        <div className="px-6 py-4 bg-green-50 border-l-4 border-green-400">
+          <div className="flex items-center">
+            <CheckCircle className="h-5 w-5 text-green-400 mr-2" />
+            <p className="text-green-700 text-sm">{successMessage}</p>
           </div>
-          <h3 className="mt-2 text-sm font-medium text-gray-900">Survey Submitted Successfully</h3>
-          <p className="mt-1 text-sm text-gray-500">
-            Thank you for your feedback! Your responses have been sent to the District Director.
+        </div>
+      )}
+
+      {/* Error Message */}
+      {errorMessage && (
+        <div className="px-6 py-4 bg-red-50 border-l-4 border-red-400">
+          <div className="flex items-center">
+            <AlertCircle className="h-5 w-5 text-red-400 mr-2" />
+            <p className="text-red-700 text-sm">{errorMessage}</p>
+          </div>
+        </div>
+      )}
+
+      {surveySubmitted ? (
+        <div className="px-6 py-8 text-center">
+          <div className="mx-auto flex items-center justify-center h-16 w-16 rounded-full bg-green-100 mb-4">
+            <CheckCircle className="h-8 w-8 text-green-600" />
+          </div>
+          <h3 className="text-lg font-medium text-gray-900 mb-2">Survey Submitted Successfully!</h3>
+          <p className="text-gray-600 mb-6">
+            Thank you for your valuable feedback. Your responses have been sent to the District Director and will help
+            improve the school feeding program.
           </p>
-          <Button
-            variant="outline"
-            size="sm"
+          <button
             onClick={() => {
               setSurveySubmitted(false)
               handleRefresh()
             }}
-            className="mt-4"
+            className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-md font-medium transition-colors"
           >
             Take Another Survey
-          </Button>
+          </button>
         </div>
       ) : (
-        <form onSubmit={handleSurveySubmit} className="divide-y divide-gray-200">
+        <form onSubmit={handleSurveySubmit}>
           {isLoading ? (
-            <div className="px-4 py-5 sm:p-6 text-center">
-              <div className="inline-block animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-blue-500"></div>
-              <p className="mt-2 text-sm text-gray-500">Loading survey questions...</p>
+            <div className="px-6 py-8 text-center">
+              <div className="inline-block animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-blue-500 mb-4"></div>
+              <p className="text-gray-600">Loading survey questions...</p>
             </div>
           ) : questions && questions.length > 0 ? (
-            questions.map((question) => (
-              <div key={question.id} className="px-4 py-5 sm:p-6">
-                <label className="block text-sm font-medium text-gray-700 mb-3">{question.question}</label>
-                <div className="mt-2 space-y-2">
-                  {question.options.map((option, index) => (
-                    <div key={index} className="flex items-center">
-                      <input
-                        id={`question-${question.id}-option-${index}`}
-                        name={`question-${question.id}`}
-                        type="radio"
-                        className="focus:ring-blue-500 h-4 w-4 text-blue-600 border-gray-300 cursor-pointer"
-                        value={option}
-                        checked={surveyResponses[question.id] === option}
-                        onChange={() => handleSurveyChange(question.id, option)}
-                      />
-                      <label
-                        htmlFor={`question-${question.id}-option-${index}`}
-                        className="ml-3 block text-sm font-medium text-gray-700"
-                      >
-                        {option}
-                      </label>
-                    </div>
-                  ))}
+            <div className="divide-y divide-gray-200">
+              {questions.map((question, index) => (
+                <div key={question.id} className="px-6 py-6">
+                  <div className="mb-4">
+                    <label className="block text-sm font-medium text-gray-900 mb-3">
+                      <span className="inline-flex items-center justify-center w-6 h-6 bg-blue-100 text-blue-600 rounded-full text-xs font-semibold mr-3">
+                        {index + 1}
+                      </span>
+                      {question.question}
+                    </label>
+                  </div>
+                  <div className="space-y-3">
+                    {question.options.map((option, optionIndex) => (
+                      <div key={optionIndex} className="flex items-center">
+                        <input
+                          id={`question-${question.id}-option-${optionIndex}`}
+                          name={`question-${question.id}`}
+                          type="radio"
+                          className="focus:ring-blue-500 h-4 w-4 text-blue-600 border-gray-300 cursor-pointer"
+                          value={option}
+                          checked={surveyResponses[question.id] === option}
+                          onChange={() => handleSurveyChange(question.id, option)}
+                        />
+                        <label
+                          htmlFor={`question-${question.id}-option-${optionIndex}`}
+                          className="ml-3 block text-sm text-gray-700 cursor-pointer hover:text-gray-900"
+                        >
+                          {option}
+                        </label>
+                      </div>
+                    ))}
+                  </div>
                 </div>
-              </div>
-            ))
-          ) : (
-            <div className="px-4 py-5 sm:p-6 text-center">
-              <p className="text-gray-500">No survey questions available at this time.</p>
+              ))}
             </div>
-          )}
-
-          {errorMessage && (
-            <div className="px-4 py-3">
-              <Alert variant="destructive">
-                <AlertDescription>{errorMessage}</AlertDescription>
-              </Alert>
+          ) : (
+            <div className="px-6 py-8 text-center">
+              <div className="text-gray-400 mb-4">
+                <svg className="mx-auto h-12 w-12" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={2}
+                    d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+                  />
+                </svg>
+              </div>
+              <p className="text-gray-500">No survey questions available at this time.</p>
+              <p className="text-sm text-gray-400 mt-2">Check back later or contact your administrator.</p>
             </div>
           )}
 
           {questions && questions.length > 0 && (
-            <div className="px-4 py-4 sm:px-6 flex justify-end">
-              <Button type="submit" disabled={submitting} className="inline-flex justify-center">
+            <div className="px-6 py-4 bg-gray-50 flex justify-between items-center">
+              <div className="text-sm text-gray-600">
+                {Object.values(surveyResponses).filter(Boolean).length} of {questions.length} questions answered
+              </div>
+              <button
+                type="submit"
+                disabled={submitting || Object.values(surveyResponses).some((response) => response === "")}
+                className="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed text-white px-6 py-2 rounded-md font-medium transition-colors flex items-center space-x-2"
+              >
                 {submitting ? (
                   <>
                     <svg
-                      className="animate-spin -ml-1 mr-3 h-5 w-5 text-white"
+                      className="animate-spin h-4 w-4 text-white"
                       xmlns="http://www.w3.org/2000/svg"
                       fill="none"
                       viewBox="0 0 24 24"
@@ -208,12 +250,12 @@ export default function SurveySection({ role, questions, onRefresh, isLoading })
                         d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
                       ></path>
                     </svg>
-                    Submitting...
+                    <span>Submitting...</span>
                   </>
                 ) : (
-                  "Submit Survey"
+                  <span>Submit Survey</span>
                 )}
-              </Button>
+              </button>
             </div>
           )}
         </form>

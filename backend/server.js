@@ -1,1251 +1,1374 @@
-const express = require("express");
-const dotenv = require("dotenv");
-const cors = require("cors");
-const bodyParser = require("body-parser");
-const session = require("express-session");
-const MySQLStore = require("express-mysql-session")(session);
-const { db, Connection } = require("./db");
-const { router: authRoutes, requireAuth, requireAdmin, requireAdminSurveyAccess } = require("./auth");
-const bcrypt = require("bcrypt");
-const PDFDocument = require('pdfkit');
-const { ChartJSNodeCanvas } = require('chartjs-node-canvas');
+const express = require("express")
+const dotenv = require("dotenv")
+const cors = require("cors")
+const bodyParser = require("body-parser")
+const session = require("express-session")
+const MySQLStore = require("express-mysql-session")(session)
+const { Server } = require("socket.io")
+const http = require("http")
+const cron = require("node-cron")
+const PDFDocument = require("pdfkit") // Replace Puppeteer with PDFKit
+const fs = require("fs")
+const path = require("path")
 
-dotenv.config();
+const { db, Connection, initializeTables } = require("./db")
+const { router: authRoutes, requireAuth, requireAdmin, requireAdminSurveyAccess } = require("./auth")
+const { AnalyticsService } = require("./analytics")
+const { ReportGenerator } = require("./reports")
+const bcrypt = require("bcrypt")
 
-const app = express();
+dotenv.config()
+
+const app = express()
+const server = http.createServer(app)
+
+// Initialize services
+const analyticsService = new AnalyticsService()
+const reportGenerator = new ReportGenerator()
+
+// Socket.IO setup for real-time updates with proper CORS
+const io = new Server(server, {
+  cors: {
+    origin: process.env.FRONTEND_URL || "http://localhost:3000",
+    methods: ["GET", "POST"],
+    credentials: true,
+  },
+})
 
 // Database options for session store
 const sessionStoreOptions = {
-  host: process.env.DB_HOST || 'localhost',
+  host: process.env.DB_HOST || "localhost",
   port: process.env.DB_PORT || 3306,
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
   database: process.env.DB_NAME,
   clearExpired: true,
-  checkExpirationInterval: 900000, // 15 minutes
-  expiration: 86400000, // 24 hours
-  createDatabaseTable: true
-};
+  checkExpirationInterval: 900000,
+  expiration: 86400000,
+  createDatabaseTable: true,
+}
 
-// Create MySQL session store
-const sessionStore = new MySQLStore(sessionStoreOptions);
+const sessionStore = new MySQLStore(sessionStoreOptions)
 
-// Set up middleware
-app.use(express.json());
-app.use(cors({
-  origin: [
-    'http://localhost:3000',  // Next.js frontend
-    'http://127.0.0.1:3000'
-  ],
-  credentials: true,
-  methods: ['GET', 'POST', 'OPTIONS', 'PUT', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
+// Middleware setup
+app.use(express.json())
+app.use(
+  cors({
+    origin: ["http://localhost:3000", "http://127.0.0.1:3000"],
+    credentials: true,
+    methods: ["GET", "POST", "OPTIONS", "PUT", "DELETE"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  }),
+)
 
-// Add error handling middleware
-app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({ 
-    success: false, 
-    message: err.message || 'Internal server error' 
-  });
-});
+app.use(bodyParser.json())
+app.use(bodyParser.urlencoded({ extended: true }))
 
-// Add this before your routes to handle preflight requests
-app.options('*', cors());
+app.use(
+  session({
+    key: "gsfp_session",
+    secret: process.env.SESSION_SECRET || "your-secret-key",
+    store: sessionStore,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      secure: process.env.NODE_ENV === "production",
+      httpOnly: true,
+      maxAge: 86400000,
+    },
+  }),
+)
 
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
+// Socket.IO connection handling
+io.on("connection", (socket) => {
+  console.log("Client connected:", socket.id)
 
-// Set up session middleware
-app.use(session({
-  key: 'gsfp_session',
-  secret: process.env.SESSION_SECRET, // Use env variable in production
-  store: sessionStore,
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    secure: process.env.NODE_ENV === 'production', // Use secure cookies in production
-    httpOnly: true,
-    maxAge: 86400000 // 24 hours
-  }
-}));
+  socket.on("join-admin-room", () => {
+    socket.join("admin-updates")
+  })
 
-// Test the database connection
-// (async () => {
-//   await Connection();
-  
-//   // Create survey_questions table if it doesn't exist
-//   try {
-//     await db.execute(`
-//       CREATE TABLE IF NOT EXISTS survey_questions (
-//         id INT AUTO_INCREMENT PRIMARY KEY,
-//         role VARCHAR(50) NOT NULL,
-//         question_text TEXT NOT NULL,
-//         options JSON NOT NULL,
-//         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-//         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-//       )
-//     `);
-//     console.log('Survey questions table created or already exists');
-    
-//     // Check if we need to migrate hardcoded questions
-//     await migrateHardcodedQuestions();
-//   } catch (error) {
-//     console.error('Error setting up survey_questions table:', error);
-//   }
-// })();
+  socket.on("disconnect", () => {
+    console.log("Client disconnected:", socket.id)
+  })
+})
 
-// Use authentication routes
-app.use('/api/auth', authRoutes);
+// Function to broadcast real-time updates
+const broadcastUpdate = (event, data) => {
+  io.to("admin-updates").emit(event, data)
+}
 
-// Survey questions for each stakeholder (hardcoded version - will be migrated to database)
+// Survey questions migration
 const surveyQuestions = {
   teacher: [
     {
-      id: 1,
       question: "How has the School Feeding Program impacted students' attendance?",
-      options: ["Increased", "No Change", "Decreased"]
+      options: ["Significantly increased", "Moderately increased", "No change", "Decreased"],
     },
     {
-      id: 2,
       question: "Have you noticed an improvement in students' concentration and academic performance?",
-      options: ["Yes, a significant improvement", "Some improvement", "No improvement"]
+      options: ["Yes, significant improvement", "Some improvement", "No improvement", "Performance declined"],
     },
     {
-      id: 3,
-      question: "How would you rate the quality of food provided?",
-      options: ["Excellent", "Good", "Fair", "Poor"]
+      question: "How would you rate the quality of meals provided?",
+      options: ["Excellent", "Good", "Fair", "Poor"],
     },
     {
-      id: 4,
-      question: "How often is food delivered on time?",
-      options: ["Always", "Sometimes", "Rarely", "Never"]
+      question: "Are students more engaged in learning after meal times?",
+      options: ["Yes, significantly", "Somewhat", "No change", "Less engaged"],
     },
     {
-      id: 5,
-      question: "Have you received complaints from students regarding the meals?",
-      options: ["Yes, frequently", "Yes, occasionally", "No complaints"]
+      question: "How often do you incorporate nutrition education in your lessons?",
+      options: ["Daily", "Weekly", "Monthly", "Rarely", "Never"],
     },
-    {
-      id: 6,
-      question: "What is your overall satisfaction with the program?",
-      options: ["Very Satisfied", "Satisfied", "Neutral", "Dissatisfied"]
-    }
-  ],
-  caterer: [
-    {
-      id: 1,
-      question: "Do you receive the necessary ingredients and supplies on time?",
-      options: ["Always", "Sometimes", "Rarely", "Never"]
-    },
-    {
-      id: 2,
-      question: "Are the funds provided sufficient for preparing nutritious meals?",
-      options: ["Yes, always", "Sometimes", "Rarely", "Never"]
-    },
-    {
-      id: 3,
-      question: "What is the biggest challenge you face in meal preparation?",
-      options: ["Insufficient funds", "Late supply of ingredients", "Lack of proper kitchen facilities", "None"]
-    },
-    {
-      id: 4,
-      question: "How often do you receive training on food safety and nutrition?",
-      options: ["Regularly (every term or more)", "Occasionally (once a year)", "Rarely (once in several years)", "Never"]
-    },
-    {
-      id: 5,
-      question: "Do you think the meal portions provided are adequate for students?",
-      options: ["Yes, always", "Sometimes", "No, they are insufficient"]
-    }
   ],
   student: [
     {
-      id: 1,
-      question: "How often do you receive meals from the School Feeding Program?",
-      options: ["Every school day", "3–4 times a week", "1–2 times a week", "Rarely"]
+      question: "How do you rate the taste of the school meals?",
+      options: ["Very good", "Good", "Okay", "Not good"],
     },
     {
-      id: 2,
-      question: "How would you rate the taste and quality of the meals?",
-      options: ["Excellent", "Good", "Fair", "Poor"]
+      question: "Do you feel more energetic after eating school meals?",
+      options: ["Yes, always", "Sometimes", "Rarely", "No"],
     },
     {
-      id: 3,
-      question: "Do you think the meals provided are enough to keep you satisfied during school hours?",
-      options: ["Yes, always", "Sometimes", "No, not enough"]
+      question: "How often do you eat the school meals?",
+      options: ["Every day", "Most days", "Sometimes", "Rarely"],
     },
     {
-      id: 4,
-      question: "Since the introduction of the program, has your attendance improved?",
-      options: ["Yes, I attend school more regularly", "No change", "I miss school less often"]
+      question: "Do you learn better after eating school meals?",
+      options: ["Yes, much better", "A little better", "No difference", "Worse"],
     },
     {
-      id: 5,
-      question: "Have you ever skipped school due to a lack of food at home?",
-      options: ["Yes, frequently", "Yes, occasionally", "No"]
-    }
+      question: "Would you recommend school meals to other students?",
+      options: ["Definitely yes", "Probably yes", "Maybe", "No"],
+    },
   ],
-  headmaster: [
+  caterer: [
     {
-      id: 1,
-      question: "How often do you inspect feeding the school?",
-      options: ["Weekly", "Monthly", "Once per term", "Rarely"]
+      question: "How would you rate the quality of ingredients supplied?",
+      options: ["Excellent", "Good", "Fair", "Poor"],
     },
     {
-      id: 2,
-      question: "What is the most common challenge observed in the program?",
-      options: ["Inconsistent food supply", "Poor food quality", "Poor hygiene practices", "No major challenges"]
+      question: "Are you able to prepare meals according to the planned menu?",
+      options: ["Always", "Most times", "Sometimes", "Rarely"],
     },
     {
-      id: 3,
-      question: "Do students and teachers report concerns about the program?",
-      options: ["Yes, frequently", "Yes, occasionally", "No reports"]
+      question: "How adequate are the cooking facilities?",
+      options: ["Very adequate", "Adequate", "Somewhat adequate", "Inadequate"],
     },
     {
-      id: 4,
-      question: "How would you rate the transparency of the program's funding and distribution?",
-      options: ["Very Transparent", "Somewhat Transparent", "Not Transparent"]
+      question: "Do you receive ingredients on time for meal preparation?",
+      options: ["Always on time", "Usually on time", "Sometimes late", "Often late"],
     },
     {
-      id: 5,
-      question: "Do you think the program has met its goal of improving student well-being?",
-      options: ["Yes, completely", "Partially", "No"]
-    }
+      question: "How would you rate student satisfaction with the meals?",
+      options: ["Very satisfied", "Satisfied", "Neutral", "Dissatisfied"],
+    },
   ],
   supplier: [
     {
-      id: 1,
-      question: "How timely are the payments for food supplies?",
-      options: ["Always on time", "Sometimes delayed", "Often delayed", "Rarely on time"]
+      question: "How would you rate the ordering process from schools?",
+      options: ["Very efficient", "Efficient", "Somewhat efficient", "Inefficient"],
     },
     {
-      id: 2,
-      question: "Are you able to supply the required food items in the right quality and quantity?",
-      options: ["Yes, always", "Sometimes", "No"]
+      question: "Are payments from schools made on time?",
+      options: ["Always on time", "Usually on time", "Sometimes delayed", "Often delayed"],
     },
     {
-      id: 3,
-      question: "What is the biggest challenge in supplying food for the program?",
-      options: ["Payment delays", "Transportation difficulties", "Quality control issues", "None"]
+      question: "How adequate is the advance notice for large orders?",
+      options: ["Very adequate", "Adequate", "Somewhat adequate", "Inadequate"],
     },
     {
-      id: 4,
-      question: "Do you receive any support or guidance from program administrators?",
-      options: ["Yes, regularly", "Occasionally", "No"]
+      question: "Do you face challenges in maintaining food quality during delivery?",
+      options: ["Never", "Rarely", "Sometimes", "Often"],
     },
     {
-      id: 5,
-      question: "How can the procurement process be improved?",
-      options: ["Faster payments", "Better communication with suppliers", "More flexible contracts", "No improvements needed"]
-    }
-  ]
-};
+      question: "How would you rate your overall relationship with the schools?",
+      options: ["Excellent", "Good", "Fair", "Poor"],
+    },
+  ],
+  headmaster: [
+    {
+      question: "How has the feeding program impacted overall school attendance?",
+      options: ["Significantly increased", "Moderately increased", "No change", "Decreased"],
+    },
+    {
+      question: "Have you observed improvements in students' academic performance?",
+      options: ["Significant improvement", "Some improvement", "No change", "Decline"],
+    },
+    {
+      question: "How would you rate parent satisfaction with the feeding program?",
+      options: ["Very satisfied", "Satisfied", "Neutral", "Dissatisfied"],
+    },
+    {
+      question: "Are the program resources (funding, supplies) adequate?",
+      options: ["Very adequate", "Adequate", "Somewhat adequate", "Inadequate"],
+    },
+    {
+      question: "How effective is the coordination between stakeholders?",
+      options: ["Very effective", "Effective", "Somewhat effective", "Ineffective"],
+    },
+  ],
+}
 
-// Migration function to populate initial survey questions from hardcoded data
-async function migrateHardcodedQuestions() {
+const migrateHardcodedQuestions = async () => {
   try {
-    // Check if questions already exist
-    const [existingQuestions] = await db.execute('SELECT COUNT(*) as count FROM survey_questions');
-    
+    const [existingQuestions] = await db.execute("SELECT COUNT(*) as count FROM survey_questions")
+
     if (existingQuestions[0].count > 0) {
-      console.log('Questions already exist in database, skipping migration');
-      return;
+      console.log("Questions already exist in database, skipping migration")
+      return
     }
-    
-    console.log('Migrating hardcoded questions to database...');
-    
-    // Insert all hardcoded questions
+
+    console.log("Migrating hardcoded questions to database...")
+
     for (const [role, questions] of Object.entries(surveyQuestions)) {
-      for (const question of questions) {
+      for (let i = 0; i < questions.length; i++) {
+        const question = questions[i]
         await db.execute(
-          'INSERT INTO survey_questions (role, question_text, options) VALUES (?, ?, ?)',
-          [role, question.question, JSON.stringify(question.options)]
-        );
+          "INSERT INTO survey_questions (role, question_text, options, question_order) VALUES (?, ?, ?, ?)",
+          [role, question.question, JSON.stringify(question.options), i + 1],
+        )
       }
     }
-    
-    console.log('Migration completed successfully');
+
+    console.log("Migration completed successfully")
   } catch (error) {
-    console.error('Error migrating questions:', error);
+    console.error("Error migrating questions:", error)
   }
 }
 
-// Function to get survey questions from database
-async function getSurveyQuestions(role) {
+// Use authentication routes
+app.use("/api/auth", authRoutes)
+
+// Role-specific survey questions endpoint (for non-admin users)
+app.get("/api/survey-questions/:role", requireAuth, async (req, res) => {
   try {
+    const { role } = req.params
+    const userRole = req.session.user.role
+
+    // Users can only access questions for their own role
+    if (userRole !== role && userRole !== "admin") {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied: You can only access questions for your role",
+      })
+    }
+
+    const validRoles = ["teacher", "student", "caterer", "supplier", "headmaster"]
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid role specified",
+      })
+    }
+
     const [questions] = await db.execute(
-      'SELECT * FROM survey_questions WHERE role = ? ORDER BY id ASC',
-      [role]
-    );
-    
-    return questions.map(q => ({
+      "SELECT * FROM survey_questions WHERE role = ? AND is_active = TRUE ORDER BY question_order ASC",
+      [role],
+    )
+
+    const formattedQuestions = questions.map((q, index) => ({
+      ...q,
       id: q.id,
-      question: q.question_text,
-      options: JSON.parse(q.options)
-    }));
+      displayOrder: index + 1,
+      options: JSON.parse(q.options),
+    }))
+
+    return res.json({
+      success: true,
+      data: formattedQuestions,
+    })
   } catch (error) {
-    console.error(`Error fetching ${role} survey questions:`, error);
-    return []; // Return empty array as fallback
+    console.error("Error fetching survey questions:", error)
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch survey questions",
+      error: error.message,
+    })
+  }
+})
+
+// Get user-specific dashboard data
+app.get("/api/dashboard/:role", requireAuth, async (req, res) => {
+  try {
+    const { role } = req.params
+    const userRole = req.session.user.role
+    const userId = req.session.user.id
+
+    // Users can only access their own role dashboard
+    if (userRole !== role && userRole !== "admin") {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied: You can only access your own dashboard",
+      })
+    }
+
+    // Get user's school and district for filtering data
+    const userSchool = req.session.user.schoolName
+    const userDistrict = req.session.user.district
+
+    const dashboardData = {
+      user: req.session.user,
+      stats: {},
+      recentActivity: [],
+      alerts: [],
+    }
+
+    // Role-specific data fetching
+    switch (role) {
+      case "teacher":
+        dashboardData.stats = await getTeacherStats(userSchool, userDistrict)
+        dashboardData.recentActivity = await getTeacherActivity(userId)
+        break
+      case "student":
+        dashboardData.stats = await getStudentStats(userSchool, userDistrict, userId)
+        dashboardData.recentActivity = await getStudentActivity(userId)
+        break
+      case "caterer":
+        dashboardData.stats = await getCatererStats(userSchool, userDistrict)
+        dashboardData.recentActivity = await getCatererActivity(userId)
+        dashboardData.alerts = await getCatererAlerts(userSchool, userDistrict)
+        break
+      case "supplier":
+        dashboardData.stats = await getSupplierStats(userDistrict, userId)
+        dashboardData.recentActivity = await getSupplierActivity(userId)
+        break
+      case "headmaster":
+        dashboardData.stats = await getHeadmasterStats(userSchool, userDistrict)
+        dashboardData.recentActivity = await getHeadmasterActivity(userId)
+        break
+    }
+
+    return res.json({
+      success: true,
+      data: dashboardData,
+    })
+  } catch (error) {
+    console.error("Error fetching dashboard data:", error)
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch dashboard data",
+      error: error.message,
+    })
+  }
+})
+
+// Helper functions for role-specific data (REAL DATA ONLY)
+async function getTeacherStats(schoolName, district) {
+  try {
+    // Get today's meal data for the school
+    const [mealData] = await db.execute(
+      "SELECT SUM(meals_planned) as planned, SUM(meals_served) as served, SUM(students_present) as present FROM meal_data WHERE school_name = ? AND date_served = CURDATE()",
+      [schoolName],
+    )
+
+    // Get enrollment data
+    const [enrollmentData] = await db.execute(
+      "SELECT SUM(total_enrolled) as total FROM enrollment_data WHERE school_name = ? ORDER BY created_at DESC LIMIT 1",
+      [schoolName],
+    )
+
+    // Get survey response count for teachers from this school
+    const [responseCount] = await db.execute(
+      "SELECT COUNT(*) as count FROM survey_responses sr JOIN users u ON sr.user_id = u.id WHERE sr.role = 'teacher' AND u.school_name = ?",
+      [schoolName],
+    )
+
+    const enrollment = enrollmentData[0]?.total || 0
+    const todayMeal = mealData[0] || { planned: 0, served: 0, present: 0 }
+
+    return {
+      studentsEnrolled: enrollment,
+      studentsPresent: todayMeal.present || 0,
+      mealsServed: todayMeal.served || 0,
+      attendanceRate: enrollment > 0 ? Math.round((todayMeal.present / enrollment) * 100) : 0,
+      surveyResponses: responseCount[0].count,
+    }
+  } catch (error) {
+    console.error("Error fetching teacher stats:", error)
+    return {
+      studentsEnrolled: 0,
+      studentsPresent: 0,
+      mealsServed: 0,
+      attendanceRate: 0,
+      surveyResponses: 0,
+    }
   }
 }
 
-// Generic function to get survey questions by role
-app.get('/api/survey-questions/:role', requireAuth, async (req, res) => {
-  const { role } = req.params;
-  
-  if (req.session.user.role !== role) {
-    return res.status(403).json({ 
-      success: false, 
-      message: `Access denied: ${role} role required` 
-    });
-  }
-  
-  const questions = await getSurveyQuestions(role);
-  
-  res.json({ 
-    success: true, 
-    message: `${role} survey questions`, 
-    data: { questions }
-  });
-});
-
-// Updated dashboard routes to include survey questions from database
-app.get('/api/teacher-dashboard', requireAuth, async (req, res) => {
-  if (req.session.user.role !== 'teacher') {
-    return res.status(403).json({ 
-      success: false, 
-      message: 'Access denied: Teacher role required' 
-    });
-  }
-  
-  const surveyQuestions = await getSurveyQuestions('teacher');
-  
-  res.json({ 
-    success: true, 
-    message: 'Teacher dashboard data', 
-    data: {
-      surveyQuestions
-      // Add other teacher-specific data here
-    }
-  });
-});
-
-app.get('/api/headmaster-dashboard', requireAuth, async (req, res) => {
-  if (req.session.user.role !== 'headmaster') {
-    return res.status(403).json({ 
-      success: false, 
-      message: 'Access denied: Headmaster role required' 
-    });
-  }
-  
-  const surveyQuestions = await getSurveyQuestions('headmaster');
-  
-  res.json({ 
-    success: true, 
-    message: 'Headmaster dashboard data', 
-    data: {
-      surveyQuestions
-      // Add other headmaster-specific data here
-    }
-  });
-});
-
-app.get('/api/student-dashboard', requireAuth, async (req, res) => {
-  if (req.session.user.role !== 'student') {
-    return res.status(403).json({ 
-      success: false, 
-      message: 'Access denied: Student role required' 
-    });
-  }
-  
-  const surveyQuestions = await getSurveyQuestions('student');
-  
-  res.json({ 
-    success: true, 
-    message: 'Student dashboard data', 
-    data: {
-      surveyQuestions
-      // Add other student-specific data here
-    }
-  });
-});
-
-app.get('/api/caterer-dashboard', requireAuth, async (req, res) => {
-  if (req.session.user.role !== 'caterer') {
-    return res.status(403).json({ 
-      success: false, 
-      message: 'Access denied: Caterer role required' 
-    });
-  }
-  
-  const surveyQuestions = await getSurveyQuestions('caterer');
-  
-  res.json({ 
-    success: true, 
-    message: 'Caterer dashboard data', 
-    data: {
-      surveyQuestions
-      // Add other caterer-specific data here
-    }
-  });
-});
-
-app.get('/api/supplier-dashboard', requireAuth, async (req, res) => {
-  if (req.session.user.role !== 'supplier') {
-    return res.status(403).json({ 
-      success: false, 
-      message: 'Access denied: Supplier role required' 
-    });
-  }
-  
-  const surveyQuestions = await getSurveyQuestions('supplier');
-  
-  res.json({ 
-    success: true, 
-    message: 'Supplier dashboard data', 
-    data: {
-      surveyQuestions
-      // Add other supplier-specific data here
-    }
-  });
-});
-
-// API endpoint to submit survey responses
-app.post('/api/submit-survey/:role', requireAuth, async (req, res) => {
+async function getStudentStats(schoolName, district, userId) {
   try {
-    const { role } = req.params;
-    const responses = req.body;
-    const userId = req.session.user.id;
-    
-    if (req.session.user.role !== role) {
-      return res.status(403).json({ 
-        success: false, 
-        message: `Access denied: ${role} role required` 
-      });
+    // Get this week's meal data for the school
+    const [weeklyMeals] = await db.execute(
+      "SELECT COUNT(*) as meals_this_week FROM meal_data WHERE school_name = ? AND date_served >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)",
+      [schoolName],
+    )
+
+    // Get user's survey responses to calculate engagement
+    const [userResponses] = await db.execute(
+      "SELECT COUNT(*) as response_count, AVG(sentiment_score) as avg_sentiment FROM survey_responses WHERE user_id = ?",
+      [userId],
+    )
+
+    const mealsThisWeek = weeklyMeals[0]?.meals_this_week || 0
+    const responseData = userResponses[0] || { response_count: 0, avg_sentiment: 0 }
+
+    // Calculate nutrition score based on meal participation
+    const nutritionScore = Math.min(100, mealsThisWeek * 20)
+
+    return {
+      mealsThisWeek: mealsThisWeek,
+      nutritionScore: nutritionScore,
+      surveyResponses: responseData.response_count,
+      engagementLevel: Math.round((responseData.avg_sentiment + 1) * 50), // Convert -1 to 1 scale to 0-100
     }
-    
-    // Validate that responses exist
+  } catch (error) {
+    console.error("Error fetching student stats:", error)
+    return {
+      mealsThisWeek: 0,
+      nutritionScore: 0,
+      surveyResponses: 0,
+      engagementLevel: 0,
+    }
+  }
+}
+
+async function getCatererStats(schoolName, district) {
+  try {
+    // Get today's meal data
+    const [todayMeals] = await db.execute(
+      "SELECT SUM(meals_planned) as planned, SUM(meals_served) as served FROM meal_data WHERE school_name = ? AND date_served = CURDATE()",
+      [schoolName],
+    )
+
+    // Get this week's meal data
+    const [weeklyMeals] = await db.execute(
+      "SELECT SUM(meals_planned) as planned, SUM(meals_served) as served FROM meal_data WHERE school_name = ? AND date_served >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)",
+      [schoolName],
+    )
+
+    // Get stock alerts
+    const [stockAlerts] = await db.execute(
+      "SELECT COUNT(*) as alerts FROM stock_data WHERE school_name = ? AND (quantity_available <= 10 OR expiry_date <= DATE_ADD(CURDATE(), INTERVAL 7 DAY))",
+      [schoolName],
+    )
+
+    const todayMeal = todayMeals[0] || { planned: 0, served: 0 }
+    const weeklyMeal = weeklyMeals[0] || { planned: 0, served: 0 }
+
+    return {
+      mealsPlannedToday: todayMeal.planned || 0,
+      mealsServedToday: todayMeal.served || 0,
+      weeklyEfficiency: weeklyMeal.planned > 0 ? Math.round((weeklyMeal.served / weeklyMeal.planned) * 100) : 0,
+      stockAlerts: stockAlerts[0].alerts,
+    }
+  } catch (error) {
+    console.error("Error fetching caterer stats:", error)
+    return {
+      mealsPlannedToday: 0,
+      mealsServedToday: 0,
+      weeklyEfficiency: 0,
+      stockAlerts: 0,
+    }
+  }
+}
+
+async function getSupplierStats(district, userId) {
+  try {
+    // Get schools in district
+    const [schoolCount] = await db.execute(
+      "SELECT COUNT(DISTINCT school_name) as count FROM enrollment_data WHERE district = ?",
+      [district],
+    )
+
+    // Get recent deliveries (based on stock updates)
+    const [recentDeliveries] = await db.execute(
+      "SELECT COUNT(*) as deliveries FROM stock_data WHERE district = ? AND last_updated >= DATE_SUB(NOW(), INTERVAL 7 DAY)",
+      [district],
+    )
+
+    // Get supplier's response rate
+    const [supplierResponses] = await db.execute(
+      "SELECT COUNT(*) as responses FROM survey_responses WHERE user_id = ?",
+      [userId],
+    )
+
+    return {
+      activeSchools: schoolCount[0]?.count || 0,
+      recentDeliveries: recentDeliveries[0]?.deliveries || 0,
+      responseRate: supplierResponses[0]?.responses || 0,
+      districtCoverage: district,
+    }
+  } catch (error) {
+    console.error("Error fetching supplier stats:", error)
+    return {
+      activeSchools: 0,
+      recentDeliveries: 0,
+      responseRate: 0,
+      districtCoverage: district || "Unknown",
+    }
+  }
+}
+
+async function getHeadmasterStats(schoolName, district) {
+  try {
+    // Get enrollment data
+    const [enrollment] = await db.execute(
+      "SELECT SUM(total_enrolled) as total FROM enrollment_data WHERE school_name = ? ORDER BY created_at DESC LIMIT 1",
+      [schoolName],
+    )
+
+    // Get this month's meal data
+    const [monthlyMeals] = await db.execute(
+      "SELECT AVG(students_present) as avg_attendance, SUM(meals_served) as total_meals FROM meal_data WHERE school_name = ? AND date_served >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)",
+      [schoolName],
+    )
+
+    // Get program efficiency
+    const [efficiency] = await db.execute(
+      "SELECT AVG(meals_served / NULLIF(meals_planned, 0) * 100) as efficiency FROM meal_data WHERE school_name = ? AND date_served >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)",
+      [schoolName],
+    )
+
+    // Get stakeholder feedback count
+    const [feedbackCount] = await db.execute(
+      "SELECT COUNT(*) as feedback FROM survey_responses sr JOIN users u ON sr.user_id = u.id WHERE u.school_name = ?",
+      [schoolName],
+    )
+
+    const enrollmentData = enrollment[0] || { total: 0 }
+    const mealData = monthlyMeals[0] || { avg_attendance: 0, total_meals: 0 }
+
+    return {
+      totalStudents: enrollmentData.total || 0,
+      averageAttendance: Math.round(mealData.avg_attendance || 0),
+      totalMealsThisMonth: mealData.total_meals || 0,
+      programEfficiency: Math.round(efficiency[0]?.efficiency || 0),
+      stakeholderFeedback: feedbackCount[0]?.feedback || 0,
+    }
+  } catch (error) {
+    console.error("Error fetching headmaster stats:", error)
+    return {
+      totalStudents: 0,
+      averageAttendance: 0,
+      totalMealsThisMonth: 0,
+      programEfficiency: 0,
+      stakeholderFeedback: 0,
+    }
+  }
+}
+
+// Activity helper functions (REAL DATA ONLY)
+async function getTeacherActivity(userId) {
+  try {
+    const [activities] = await db.execute(
+      `SELECT 'Submitted survey response' as action, created_at as time FROM survey_responses WHERE user_id = ?
+       UNION ALL
+       SELECT 'Updated meal data' as action, created_at as time FROM meal_data WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+       ORDER BY time DESC LIMIT 5`,
+      [userId],
+    )
+
+    return activities.map((activity) => ({
+      action: activity.action,
+      time: new Date(activity.time).toLocaleString(),
+    }))
+  } catch (error) {
+    console.error("Error fetching teacher activity:", error)
+    return []
+  }
+}
+
+async function getStudentActivity(userId) {
+  try {
+    const [activities] = await db.execute(
+      "SELECT 'Completed survey' as action, created_at as time FROM survey_responses WHERE user_id = ? ORDER BY created_at DESC LIMIT 5",
+      [userId],
+    )
+
+    return activities.map((activity) => ({
+      action: activity.action,
+      time: new Date(activity.time).toLocaleString(),
+    }))
+  } catch (error) {
+    console.error("Error fetching student activity:", error)
+    return []
+  }
+}
+
+async function getCatererActivity(userId) {
+  try {
+    const [activities] = await db.execute(
+      `SELECT 'Updated stock levels' as action, last_updated as time FROM stock_data WHERE last_updated >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+       UNION ALL
+       SELECT 'Submitted survey' as action, created_at as time FROM survey_responses WHERE user_id = ?
+       ORDER BY time DESC LIMIT 5`,
+      [userId],
+    )
+
+    return activities.map((activity) => ({
+      action: activity.action,
+      time: new Date(activity.time).toLocaleString(),
+    }))
+  } catch (error) {
+    console.error("Error fetching caterer activity:", error)
+    return []
+  }
+}
+
+async function getSupplierActivity(userId) {
+  try {
+    const [activities] = await db.execute(
+      `SELECT 'Updated inventory' as action, last_updated as time FROM stock_data WHERE last_updated >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+       UNION ALL
+       SELECT 'Submitted survey' as action, created_at as time FROM survey_responses WHERE user_id = ?
+       ORDER BY time DESC LIMIT 5`,
+      [userId],
+    )
+
+    return activities.map((activity) => ({
+      action: activity.action,
+      time: new Date(activity.time).toLocaleString(),
+    }))
+  } catch (error) {
+    console.error("Error fetching supplier activity:", error)
+    return []
+  }
+}
+
+async function getHeadmasterActivity(userId) {
+  try {
+    const [activities] = await db.execute(
+      `SELECT 'Reviewed program data' as action, created_at as time FROM meal_data WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+       UNION ALL
+       SELECT 'Submitted survey' as action, created_at as time FROM survey_responses WHERE user_id = ?
+       ORDER BY time DESC LIMIT 5`,
+      [userId],
+    )
+
+    return activities.map((activity) => ({
+      action: activity.action,
+      time: new Date(activity.time).toLocaleString(),
+    }))
+  } catch (error) {
+    console.error("Error fetching headmaster activity:", error)
+    return []
+  }
+}
+
+async function getCatererAlerts(schoolName, district) {
+  try {
+    const [alerts] = await db.execute(
+      "SELECT item_name, quantity_available, expiry_date FROM stock_data WHERE school_name = ? AND (quantity_available <= 10 OR expiry_date <= DATE_ADD(CURDATE(), INTERVAL 7 DAY)) LIMIT 5",
+      [schoolName],
+    )
+
+    return alerts.map((alert) => ({
+      type: alert.quantity_available <= 10 ? "low_stock" : "expiring",
+      message:
+        alert.quantity_available <= 10
+          ? `Low stock: ${alert.item_name} (${alert.quantity_available} remaining)`
+          : `Expiring soon: ${alert.item_name} (expires ${alert.expiry_date})`,
+      priority: alert.quantity_available <= 5 ? "high" : "medium",
+    }))
+  } catch (error) {
+    console.error("Error fetching caterer alerts:", error)
+    return []
+  }
+}
+
+// Enhanced survey submission with real-time updates
+app.post("/api/submit-survey/:role", requireAuth, async (req, res) => {
+  try {
+    const { role } = req.params
+    const responses = req.body
+    const userId = req.session.user.id
+
+    if (req.session.user.role !== role) {
+      return res.status(403).json({
+        success: false,
+        message: `Access denied: ${role} role required`,
+      })
+    }
+
     if (!responses || Object.keys(responses).length === 0) {
       return res.status(400).json({
         success: false,
-        message: 'Survey responses are required'
-      });
+        message: "Survey responses are required",
+      })
     }
-    
-    // Get questions for this role to include question text
-    const questions = await getSurveyQuestions(role);
-    
+
+    // Get questions for this role
+    const [questions] = await db.execute("SELECT * FROM survey_questions WHERE role = ? ORDER BY question_order ASC", [
+      role,
+    ])
+
     // Format responses with question text
-    const formattedResponses = {};
-    Object.keys(responses).forEach(questionId => {
-      // Find the corresponding question
-      const question = questions.find(q => q.id.toString() === questionId);
+    const formattedResponses = {}
+    let totalSentiment = 0
+    let sentimentCount = 0
+
+    Object.keys(responses).forEach((questionId) => {
+      const question = questions.find((q) => q.id.toString() === questionId)
       if (question) {
+        const answer = responses[questionId]
+
+        // Calculate sentiment for this response
+        const sentiment = analyticsService.sentimentAnalyzer.analyzeSentiment(answer)
+        totalSentiment += sentiment
+        sentimentCount++
+
         formattedResponses[questionId] = {
-          question: question.question,
-          answer: responses[questionId]
-        };
-      } else {
-        // If question not found, just store the answer
-        formattedResponses[questionId] = {
-          answer: responses[questionId]
-        };
+          question: question.question_text,
+          answer: answer,
+          sentiment: sentiment,
+        }
       }
-    });
-    
-    console.log(`Formatted ${role} survey responses:`, JSON.stringify(formattedResponses, null, 2));
-    
-    // Save the formatted responses to the database
+    })
+
+    const avgSentiment = sentimentCount > 0 ? totalSentiment / sentimentCount : 0
+
+    // Save responses with sentiment score
     const [result] = await db.execute(
-      'INSERT INTO survey_responses (user_id, role, responses) VALUES (?, ?, ?)',
-      [userId, role, JSON.stringify(formattedResponses)]
-    );
-    
+      "INSERT INTO survey_responses (user_id, role, responses, sentiment_score) VALUES (?, ?, ?, ?)",
+      [userId, role, JSON.stringify(formattedResponses), avgSentiment],
+    )
+
     if (result.affectedRows === 1) {
-      console.log(`Survey responses from ${role} (ID: ${userId}) saved successfully`);
-      
-      return res.json({ 
-        success: true, 
-        message: 'Survey responses submitted successfully',
+      console.log(`Survey responses from ${role} (ID: ${userId}) saved successfully`)
+
+      // Broadcast real-time update to admin dashboard
+      broadcastUpdate("new-survey-response", {
+        role,
+        userId,
+        userName: req.session.user.fullName,
+        sentimentScore: avgSentiment,
+        timestamp: new Date().toISOString(),
+      })
+
+      return res.json({
+        success: true,
+        message: "Survey responses submitted successfully",
         data: {
-          responseId: result.insertId
-        }
-      });
+          responseId: result.insertId,
+          sentimentScore: avgSentiment,
+        },
+      })
     } else {
-      throw new Error('Failed to save survey responses');
+      throw new Error("Failed to save survey responses")
     }
   } catch (error) {
-    console.error('Error saving survey responses:', error);
-    return res.status(500).json({ 
-      success: false, 
-      message: 'Failed to save survey responses',
-      error: error.message
-    });
-  }
-});
-
-// New route to fetch survey responses for a specific role
-app.get('/api/survey-responses/:role', requireAuth, async (req, res) => {
-  try {
-    const { role } = req.params;
-    
-    // Ensure the user has the correct role to access these responses
-    if (req.session.user.role !== role) {
-      return res.status(403).json({ 
-        success: false, 
-        message: `Access denied: ${role} role required` 
-      });
-    }
-    
-    // Fetch survey responses for the specific role
-    const [responses] = await db.execute(
-      'SELECT id, responses, created_at FROM survey_responses WHERE role = ? ORDER BY created_at DESC',
-      [role]
-    );
-    
-    // Parse the JSON responses and add sentiment analysis
-    const processedResponses = responses.map(response => {
-      const parsedResponses = JSON.parse(response.responses);
-      
-      // Basic sentiment analysis function
-      const analyzeSentiment = (answer, options) => {
-        const positiveIndicators = ['Yes', 'Always', 'Excellent', 'Very', 'Increased', 'Satisfied'];
-        const negativeIndicators = ['No', 'Never', 'Poor', 'Rarely', 'Decreased', 'Dissatisfied'];
-        
-        const lowerAnswer = answer.toLowerCase();
-        
-        if (positiveIndicators.some(indicator => lowerAnswer.includes(indicator.toLowerCase()))) {
-          return 1; // Positive
-        } else if (negativeIndicators.some(indicator => lowerAnswer.includes(indicator.toLowerCase()))) {
-          return -1; // Negative
-        }
-        
-        return 0; // Neutral
-      };
-      
-      // Calculate overall sentiment
-      const sentimentScores = Object.entries(parsedResponses).map(([questionId, response]) => 
-        analyzeSentiment(response.answer, response.options)
-      );
-      
-      const averageSentiment = sentimentScores.reduce((a, b) => a + b, 0) / sentimentScores.length;
-      
-      return {
-        id: response.id,
-        responses: parsedResponses,
-        createdAt: response.created_at,
-        sentimentScore: averageSentiment
-      };
-    });
-    
-    res.json({ 
-      success: true, 
-      message: `${role} survey responses`, 
-      data: processedResponses 
-    });
-  } catch (error) {
-    console.error('Error fetching survey responses:', error);
-    res.status(500).json({ 
-      success: false, 
-      message: 'Failed to fetch survey responses',
-      error: error.message 
-    });
-  }
-});
-
-// New route to get current user session
-app.get('/api/session', requireAuth, (req, res) => {
-  // Remove sensitive information before sending
-  const { password, ...userWithoutPassword } = req.session.user;
-  
-  res.json({ 
-    success: true, 
-    user: userWithoutPassword 
-  });
-});
-
-// Add these admin-specific routes to your server.js file
-// API endpoint to check admin status
-app.get('/api/auth/users', requireAuth, async (req, res) => {
-  try {
-    // Get the current user from session
-    const user = req.session.user;
-    
-    // Remove sensitive information
-    const { password, ...userWithoutPassword } = user;
-    
-    return res.json({
-      success: true,
-      user: userWithoutPassword
-    });
-  } catch (error) {
-    console.error('Error fetching user information:', error);
-    return res.status(500).json({ 
-      success: false, 
-      message: 'Failed to fetch user information',
-      error: error.message
-    });
-  }
-});
-
-// Fix for the sentiment analysis function in the admin endpoint
-app.get('/api/admin/survey-responses/:role', requireAuth, requireAdmin, async (req, res) => {
-  try {
-    const { role } = req.params;
-    
-    // Validate role parameter
-    const validRoles = ['teacher', 'student', 'caterer', 'supplier', 'headmaster'];
-    if (!validRoles.includes(role)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid role specified'
-      });
-    }
-    
-    // Fetch survey responses for the specified role
-    const [responses] = await db.execute(
-      'SELECT sr.id, sr.user_id, u.full_name, sr.responses, sr.created_at FROM survey_responses sr ' +
-      'LEFT JOIN users u ON sr.user_id = u.id ' +
-      'WHERE sr.role = ? ORDER BY sr.created_at DESC',
-      [role]
-    );
-    
-    // Process the responses
-    const processedResponses = responses.map(response => {
-      let parsedResponses;
-      try {
-        parsedResponses = JSON.parse(response.responses);
-      } catch (e) {
-        console.error('Error parsing responses JSON:', e);
-        parsedResponses = {}; // Fallback  {
-        console.error('Error parsing responses JSON:', e);
-        parsedResponses = {}; // Fallback to empty object if parsing fails
-      }
-      
-      // Basic sentiment analysis function - FIXED
-      const analyzeSentiment = (responsesObj) => {
-        const positiveIndicators = ['yes', 'always', 'excellent', 'very', 'increased', 'satisfied', 'good', 'improvement'];
-        const negativeIndicators = ['no', 'never', 'poor', 'rarely', 'decreased', 'dissatisfied'];
-        
-        let sentimentScore = 0;
-        let count = 0;
-        
-        // Safely iterate through the parsed responses
-        Object.values(responsesObj).forEach(data => {
-          if (data && typeof data === 'object' && 'answer' in data) {
-            const answer = String(data.answer).toLowerCase(); // Convert to string first
-            
-            if (positiveIndicators.some(indicator => answer.includes(indicator))) {
-              sentimentScore += 1;
-            } else if (negativeIndicators.some(indicator => answer.includes(indicator))) {
-              sentimentScore -= 1;
-            }
-            count++;
-          }
-        });
-        
-        return count > 0 ? sentimentScore / count : 0;
-      };
-      
-      return {
-        id: response.id,
-        userId: response.user_id,
-        userName: response.full_name || `User ${response.user_id}`,
-        responses: parsedResponses,
-        createdAt: response.created_at,
-        sentimentScore: analyzeSentiment(parsedResponses)
-      };
-    });
-    
-    return res.json({ 
-      success: true, 
-      message: `Admin access to ${role} survey responses`, 
-      data: processedResponses 
-    });
-  } catch (error) {
-    console.error('Error fetching survey responses for admin:', error);
-    return res.status(500).json({ 
-      success: false, 
-      message: 'Failed to fetch survey responses',
-      error: error.message 
-    });
-  }
-});
-
-// Admin endpoint to get summary statistics
-app.get('/api/admin/statistics', requireAuth, requireAdmin, async (req, res) => {
-  try {
-    // Get counts by role
-    const [roleCounts] = await db.execute(
-      'SELECT role, COUNT(*) as count FROM survey_responses GROUP BY role'
-    );
-    
-    // Format as an object
-    const responsesByRole = {};
-    roleCounts.forEach(row => {
-      responsesByRole[row.role] = row.count;
-    });
-    
-    // Get total responses
-    const [totalResult] = await db.execute(
-      'SELECT COUNT(*) as total FROM survey_responses'
-    );
-    const totalResponses = totalResult[0].total;
-    
-    // Get unique users who have responded
-    const [uniqueUsers] = await db.execute(
-      'SELECT COUNT(DISTINCT user_id) as count FROM survey_responses'
-    );
-    
-    return res.json({
-      success: true,
-      data: {
-        totalResponses,
-        uniqueRespondents: uniqueUsers[0].count,
-        responsesByRole
-      }
-    });
-  } catch (error) {
-    console.error('Error fetching admin statistics:', error);
+    console.error("Error saving survey responses:", error)
     return res.status(500).json({
       success: false,
-      message: 'Failed to fetch statistics',
-      error: error.message
-    });
+      message: "Failed to save survey responses",
+      error: error.message,
+    })
   }
-});
+})
 
-// PDF Generation endpoint for admin
-app.get('/api/admin/download-responses/:role', requireAuth, requireAdmin, async (req, res) => {
+// Enhanced analytics endpoints
+app.get("/api/admin/analytics/dashboard", requireAuth, requireAdmin, async (req, res) => {
   try {
-    const { role } = req.params;
-    
-    // Validate role parameter
-    const validRoles = ['teacher', 'student', 'caterer', 'supplier', 'headmaster'];
-    if (!validRoles.includes(role)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid role specified'
-      });
+    const dateRange = {
+      start: req.query.startDate || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split("T")[0],
+      end: req.query.endDate || new Date().toISOString().split("T")[0],
     }
-    
-    // Fetch survey responses for the specified role
-    const [responses] = await db.execute(
-      'SELECT sr.id, sr.user_id, u.full_name, sr.responses, sr.created_at FROM survey_responses sr ' +
-      'LEFT JOIN users u ON sr.user_id = u.id ' +
-      'WHERE sr.role = ? ORDER BY sr.created_at DESC',
-      [role]
-    );
-    
-    // Create a new PDF document
-    const doc = new PDFDocument({ margin: 50 });
-    
-    // Set response headers
-    res.setHeader('Content-Type', 'application/pdf');
-    res.setHeader('Content-Disposition', `attachment; filename=${role}-survey-responses.pdf`);
-    
-    // Pipe the PDF to the response
-    doc.pipe(res);
-    
-    // Add title
-    doc.fontSize(20).font('Helvetica-Bold').text(`${role.charAt(0).toUpperCase() + role.slice(1)} Survey Responses`, {
-      align: 'center'
-    });
-    
-    doc.moveDown();
-    doc.fontSize(12).font('Helvetica').text(`Generated on: ${new Date().toLocaleString()}`, {
-      align: 'center'
-    });
-    
-    doc.moveDown(2);
-    
-    // Add summary information
-    doc.fontSize(16).font('Helvetica-Bold').text('Summary', {
-      underline: true
-    });
-    
-    doc.moveDown();
-    
-    // Add total number of responses
-    doc.fontSize(12).font('Helvetica').text(`Total Responses: ${responses.length}`);
-    
-    // Generate sentiment analysis summary
-    let positiveCount = 0;
-    let neutralCount = 0;
-    let negativeCount = 0;
-    
-    // Basic sentiment analysis function
-    const analyzeSentiment = (responsesObj) => {
-      const positiveIndicators = ['yes', 'always', 'excellent', 'very', 'increased', 'satisfied', 'good', 'improvement'];
-      const negativeIndicators = ['no', 'never', 'poor', 'rarely', 'decreased', 'dissatisfied'];
-      
-      let sentimentScore = 0;
-      let count = 0;
-      
-      // Safely iterate through the parsed responses
-      Object.values(responsesObj).forEach(data => {
-        if (data && typeof data === 'object' && 'answer' in data) {
-          const answer = String(data.answer).toLowerCase();
-          
-          if (positiveIndicators.some(indicator => answer.includes(indicator))) {
-            sentimentScore += 1;
-          } else if (negativeIndicators.some(indicator => answer.includes(indicator))) {
-            sentimentScore -= 1;
-          }
-          count++;
-        }
-      });
-      
-      return count > 0 ? sentimentScore / count : 0;
-    };
-    
-    // Process response sentiment
-    responses.forEach(response => {
-      let parsedResponses;
-      try {
-        parsedResponses = JSON.parse(response.responses);
-      } catch (e) {
-        console.error('Error parsing responses JSON:', e);
-        parsedResponses = {};
-      }
-      
-      const sentimentScore = analyzeSentiment(parsedResponses);
-      
-      if (sentimentScore > 0.3) {
-        positiveCount++;
-      } else if (sentimentScore < -0.3) {
-        negativeCount++;
-      } else {
-        neutralCount++;
-      }
-    });
-    
-    doc.moveDown();
-    doc.text(`Sentiment Analysis:`);
-    doc.text(`• Positive Responses: ${positiveCount} (${Math.round((positiveCount / responses.length) * 100)}%)`);
-    doc.text(`• Neutral Responses: ${neutralCount} (${Math.round((neutralCount / responses.length) * 100)}%)`);
-    doc.text(`• Negative Responses: ${negativeCount} (${Math.round((negativeCount / responses.length) * 100)}%)`);
-    
-    doc.moveDown(2);
-    
-    // Draw responses timeline chart if using chartjs-node-canvas
-    // This is a more advanced feature and might need adjustment based on your setup
-    if (responses.length > 0) {
-      try {
-        // Create a timeline dataset of responses
-        const timeData = new Map();
-        
-        responses.forEach(response => {
-          const date = new Date(response.created_at).toLocaleDateString();
-          
-          if (!timeData.has(date)) {
-            timeData.set(date, {
-              date,
-              count: 0
-            });
-          }
-          
-          timeData.get(date).count++;
-        });
-        
-        // Sort by date and convert to array
-        const timelineData = Array.from(timeData.values())
-          .sort((a, b) => new Date(a.date) - new Date(b.date));
-        
-        // Only create chart if we have timeline data
-        if (timelineData.length > 0) {
-          // Create Chart.js configuration
-          const width = 600;
-          const height = 400;
-          const chartCallback = (ChartJS) => {
-            // Optional: Global chart configuration
-          };
-          
-          const chartJSNodeCanvas = new ChartJSNodeCanvas({ width, height, chartCallback });
-          
-          const chartConfiguration = {
-            type: 'line',
-            data: {
-              labels: timelineData.map(item => item.date),
-              datasets: [{
-                label: 'Responses',
-                data: timelineData.map(item => item.count),
-                borderColor: 'rgb(75, 192, 192)',
-                tension: 0.1,
-                fill: false
-              }]
-            },
-            options: {
-              scales: {
-                y: {
-                  beginAtZero: true,
-                  title: {
-                    display: true,
-                    text: 'Number of Responses'
-                  }
-                },
-                x: {
-                  title: {
-                    display: true,
-                    text: 'Date'
-                  }
-                }
-              },
-              plugins: {
-                title: {
-                  display: true,
-                  text: 'Response Timeline'
-                }
-              }
-            }
-          };
-          
-          // Generate chart image buffer
-          const imageBuffer = await chartJSNodeCanvas.renderToBuffer(chartConfiguration);
-          
-          // Add chart title
-          doc.fontSize(16).font('Helvetica-Bold').text('Response Timeline', {
-            underline: true
-          });
-          
-          doc.moveDown();
-          
-          // Add the chart image to the PDF
-          doc.image(imageBuffer, {
-            fit: [500, 300],
-            align: 'center'
-          });
-          
-          doc.moveDown(2);
-        }
-      } catch (chartError) {
-        console.error('Error generating chart:', chartError);
-        // Continue without the chart if there's an error
-      }
-    }
-    
-    // Add detailed responses section
-    doc.fontSize(16).font('Helvetica-Bold').text('Detailed Responses', {
-      underline: true
-    });
-    
-    doc.moveDown();
-    
-    // Process and add each response
-    for (let i = 0; i < responses.length; i++) {
-      const response = responses[i];
-      let parsedResponses;
-      
-      try {
-        parsedResponses = JSON.parse(response.responses);
-      } catch (e) {
-        console.error('Error parsing responses JSON:', e);
-        parsedResponses = {};
-      }
-      
-      // Calculate sentiment for this response
-      const sentimentScore = analyzeSentiment(parsedResponses);
-      let sentimentLabel = 'Neutral';
-      
-      if (sentimentScore > 0.3) {
-        sentimentLabel = 'Positive';
-      } else if (sentimentScore < -0.3) {
-        sentimentLabel = 'Negative';
-      }
-      
-      // Add response header
-      doc.fontSize(14).font('Helvetica-Bold')
-         .text(`Response #${i + 1} - ${response.full_name || `User ${response.user_id}`}`);
-      
-      doc.fontSize(12).font('Helvetica')
-         .text(`Date: ${new Date(response.created_at).toLocaleString()}`);
-      
-      doc.text(`Overall Sentiment: ${sentimentLabel} (${sentimentScore.toFixed(2)})`);
-      
-      doc.moveDown();
-      
-      // Format and add individual question responses
-      if (parsedResponses && typeof parsedResponses === 'object') {
-        Object.entries(parsedResponses).forEach(([questionId, data]) => {
-          doc.fontSize(12).font('Helvetica-Bold')
-             .text(data.question || `Question ${questionId}`);
-          
-          doc.fontSize(12).font('Helvetica')
-             .text(`Answer: ${data.answer || 'No answer'}`);
-          
-          doc.moveDown();
-        });
-      } else {
-        doc.text('No detailed responses available');
-      }
-      
-      // Add a separator between responses
-      if (i < responses.length - 1) {
-        doc.moveDown();
-        doc.strokeColor('#aaaaaa').lineWidth(1).moveTo(50, doc.y).lineTo(550, doc.y).stroke();
-        doc.moveDown(2);
-      }
-      
-      // Check if we need a new page
-      if (doc.y > 700 && i < responses.length - 1) {
-        doc.addPage();
-      }
-    }
-    
-    // Finalize the PDF
-    doc.end();
-    
+
+    const analyticsData = await analyticsService.generateAnalyticsReport(dateRange)
+
+    return res.json({
+      success: true,
+      data: analyticsData,
+    })
   } catch (error) {
-    console.error('Error generating PDF:', error);
-    return res.status(500).json({ 
-      success: false, 
-      message: 'Failed to generate PDF report',
-      error: error.message 
-    });
+    console.error("Error fetching analytics dashboard:", error)
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch analytics data",
+      error: error.message,
+    })
   }
-});
+})
 
-// NEW ENDPOINTS FOR ADMIN SURVEY QUESTION MANAGEMENT
-
-// 1. Get all survey questions for a specific role
-app.get('/api/admin/survey-questions/:role', requireAuth, requireAdminSurveyAccess, async (req, res) => {
+// Real-time trends endpoint
+app.get("/api/admin/analytics/trends/:role", requireAuth, requireAdmin, async (req, res) => {
   try {
-    const { role } = req.params;
-    
-    // Validate role parameter
-    const validRoles = ['teacher', 'student', 'caterer', 'supplier', 'headmaster'];
+    const { role } = req.params
+    const dateRange =
+      req.query.startDate && req.query.endDate
+        ? {
+            start: req.query.startDate,
+            end: req.query.endDate,
+          }
+        : null
+
+    const trends = await analyticsService.getSurveyTrends(role, dateRange)
+
+    return res.json({
+      success: true,
+      data: trends,
+    })
+  } catch (error) {
+    console.error("Error fetching trends:", error)
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch trends data",
+      error: error.message,
+    })
+  }
+})
+
+// Admin-only survey questions endpoint
+app.get("/api/admin/survey-questions/:role", requireAuth, requireAdminSurveyAccess, async (req, res) => {
+  try {
+    const { role } = req.params
+
+    const validRoles = ["teacher", "student", "caterer", "supplier", "headmaster"]
     if (!validRoles.includes(role)) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid role specified'
-      });
+        message: "Invalid role specified",
+      })
     }
-    
-    // Fetch questions from database
-    const [questions] = await db.execute(
-      'SELECT * FROM survey_questions WHERE role = ? ORDER BY id ASC',
-      [role]
-    );
-    
-    // Parse options JSON
-    const formattedQuestions = questions.map(q => ({
+
+    const [questions] = await db.execute("SELECT * FROM survey_questions WHERE role = ? ORDER BY question_order ASC", [
+      role,
+    ])
+
+    const formattedQuestions = questions.map((q, index) => ({
       ...q,
-      options: JSON.parse(q.options)
-    }));
-    
+      id: q.id,
+      displayOrder: index + 1,
+      options: JSON.parse(q.options),
+    }))
+
     return res.json({
       success: true,
-      data: formattedQuestions
-    });
+      data: formattedQuestions,
+    })
   } catch (error) {
-    console.error('Error fetching survey questions:', error);
+    console.error("Error fetching survey questions:", error)
     return res.status(500).json({
       success: false,
-      message: 'Failed to fetch survey questions',
-      error: error.message
-    });
+      message: "Failed to fetch survey questions",
+      error: error.message,
+    })
   }
-});
+})
 
-// 2. Add a new survey question
-app.post('/api/admin/survey-questions', requireAuth, requireAdminSurveyAccess, async (req, res) => {
+// Add new survey question (Admin only)
+app.post("/api/admin/survey-questions", requireAuth, requireAdmin, async (req, res) => {
   try {
-    const { role, questionText, options } = req.body;
-    
-    // Validate input
-    if (!role || !questionText || !options || !Array.isArray(options) || options.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'Role, question text, and options array are required'
-      });
-    }
-    
-    // Validate role
-    const validRoles = ['teacher', 'student', 'caterer', 'supplier', 'headmaster'];
+    const { role, questionText, options } = req.body
+
+    const validRoles = ["teacher", "student", "caterer", "supplier", "headmaster"]
     if (!validRoles.includes(role)) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid role specified'
-      });
+        message: "Invalid role specified",
+      })
     }
-    
-    // Insert new question
-    const [result] = await db.execute(
-      'INSERT INTO survey_questions (role, question_text, options) VALUES (?, ?, ?)',
-      [role, questionText, JSON.stringify(options)]
-    );
-    
-    if (result.affectedRows === 1) {
-      return res.status(201).json({
-        success: true,
-        message: 'Survey question added successfully',
-        data: {
-          id: result.insertId,
-          role,
-          questionText,
-          options
-        }
-      });
-    } else {
-      throw new Error('Failed to add survey question');
-    }
-  } catch (error) {
-    console.error('Error adding survey question:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Failed to add survey question',
-      error: error.message
-    });
-  }
-});
 
-// 3. Update an existing survey question
-app.put('/api/admin/survey-questions/:id', requireAuth, requireAdminSurveyAccess, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { questionText, options } = req.body;
-    
-    // Validate input
-    if (!questionText || !options || !Array.isArray(options) || options.length === 0) {
+    if (!questionText || !options || options.length < 2) {
       return res.status(400).json({
         success: false,
-        message: 'Question text and options array are required'
-      });
+        message: "Question text and at least 2 options are required",
+      })
     }
-    
-    // Check if question exists
-    const [existingQuestions] = await db.execute(
-      'SELECT * FROM survey_questions WHERE id = ?',
-      [id]
-    );
-    
-    if (existingQuestions.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Survey question not found'
-      });
-    }
-    
-    // Update the question
+
+    // Get the next question order
+    const [maxOrder] = await db.execute(
+      "SELECT COALESCE(MAX(question_order), 0) + 1 as next_order FROM survey_questions WHERE role = ?",
+      [role],
+    )
+
     const [result] = await db.execute(
-      'UPDATE survey_questions SET question_text = ?, options = ? WHERE id = ?',
-      [questionText, JSON.stringify(options), id]
-    );
-    
+      "INSERT INTO survey_questions (role, question_text, options, question_order) VALUES (?, ?, ?, ?)",
+      [role, questionText, JSON.stringify(options), maxOrder[0].next_order],
+    )
+
     if (result.affectedRows === 1) {
       return res.json({
         success: true,
-        message: 'Survey question updated successfully',
-        data: {
-          id: parseInt(id),
-          questionText,
-          options
+        message: "Question added successfully",
+        data: { questionId: result.insertId },
+      })
+    } else {
+      throw new Error("Failed to add question")
+    }
+  } catch (error) {
+    console.error("Error adding survey question:", error)
+    return res.status(500).json({
+      success: false,
+      message: "Failed to add survey question",
+      error: error.message,
+    })
+  }
+})
+
+// Update survey question (Admin only)
+app.put("/api/admin/survey-questions/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params
+    const { questionText, options } = req.body
+
+    if (!questionText || !options || options.length < 2) {
+      return res.status(400).json({
+        success: false,
+        message: "Question text and at least 2 options are required",
+      })
+    }
+
+    const [result] = await db.execute(
+      "UPDATE survey_questions SET question_text = ?, options = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+      [questionText, JSON.stringify(options), id],
+    )
+
+    if (result.affectedRows === 1) {
+      return res.json({
+        success: true,
+        message: "Question updated successfully",
+      })
+    } else {
+      return res.status(404).json({
+        success: false,
+        message: "Question not found",
+      })
+    }
+  } catch (error) {
+    console.error("Error updating survey question:", error)
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update survey question",
+      error: error.message,
+    })
+  }
+})
+
+// Delete survey question (Admin only)
+app.delete("/api/admin/survey-questions/:id", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params
+
+    const [result] = await db.execute("DELETE FROM survey_questions WHERE id = ?", [id])
+
+    if (result.affectedRows === 1) {
+      return res.json({
+        success: true,
+        message: "Question deleted successfully",
+      })
+    } else {
+      return res.status(404).json({
+        success: false,
+        message: "Question not found",
+      })
+    }
+  } catch (error) {
+    console.error("Error deleting survey question:", error)
+    return res.status(500).json({
+      success: false,
+      message: "Failed to delete survey question",
+      error: error.message,
+    })
+  }
+})
+
+// PDFKit PDF Generation Function - FIXED AND IMPROVED
+async function generatePDFReport(reportData) {
+  return new Promise((resolve, reject) => {
+    try {
+      // Create a new PDF document
+      const doc = new PDFDocument({
+        size: "A4",
+        margin: 50,
+        info: {
+          Title: reportData.title || "School Feeding Program Report",
+          Author: "School Feeding Program Analytics",
+          Subject: "Survey Analysis Report",
+          Creator: "GSFP Analytics System",
+        },
+      })
+
+      // Create a buffer to store the PDF
+      const chunks = []
+      doc.on("data", (chunk) => chunks.push(chunk))
+      doc.on("end", () => {
+        const pdfBuffer = Buffer.concat(chunks)
+        resolve(pdfBuffer)
+      })
+      doc.on("error", (error) => reject(error))
+
+      // Helper function to add a new page if needed
+      const checkPageSpace = (requiredSpace = 100) => {
+        if (doc.y + requiredSpace > doc.page.height - 50) {
+          doc.addPage()
         }
-      });
-    } else {
-      throw new Error('Failed to update survey question');
-    }
-  } catch (error) {
-    console.error('Error updating survey question:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Failed to update survey question',
-      error: error.message
-    });
-  }
-});
-
-// 4. Delete a survey question
-app.delete('/api/admin/survey-questions/:id', requireAuth, requireAdminSurveyAccess, async (req, res) => {
-  try {
-    const { id } = req.params;
-    
-    // Check if question exists
-    const [existingQuestions] = await db.execute(
-      'SELECT * FROM survey_questions WHERE id = ?',
-      [id]
-    );
-    
-    if (existingQuestions.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: 'Survey question not found'
-      });
-    }
-    
-    // Delete the question
-    const [result] = await db.execute(
-      'DELETE FROM survey_questions WHERE id = ?',
-      [id]
-    );
-    
-    if (result.affectedRows === 1) {
-      return res.json({
-        success: true,
-        message: 'Survey question deleted successfully'
-      });
-    } else {
-      throw new Error('Failed to delete survey question');
-    }
-  } catch (error) {
-    console.error('Error deleting survey question:', error);
-    return res.status(500).json({
-      success: false,
-      message: 'Failed to delete survey question',
-      error: error.message
-    });
-  }
-});
-
-// 5. Get all survey questions for admin dashboard
-app.get('/api/admin/survey-questions', requireAuth, requireAdminSurveyAccess, async (req, res) => {
-  try {
-    // Fetch all questions grouped by role
-    const [questions] = await db.execute(
-      'SELECT * FROM survey_questions ORDER BY role, id ASC'
-    );
-    
-    // Group questions by role
-    const questionsByRole = {};
-    
-    questions.forEach(question => {
-      if (!questionsByRole[question.role]) {
-        questionsByRole[question.role] = [];
       }
-      
-      questionsByRole[question.role].push({
-        ...question,
-        options: JSON.parse(question.options)
-      });
-    });
-    
-    return res.json({
-      success: true,
-      data: questionsByRole
-    });
+
+      // Header
+      doc
+        .fontSize(20)
+        .font("Helvetica-Bold")
+        .fillColor("#2563eb")
+        .text(reportData.title || "Survey Analysis Report", {
+          align: "center",
+        })
+
+      doc.moveDown(0.5)
+      doc
+        .fontSize(12)
+        .font("Helvetica")
+        .fillColor("#666666")
+        .text(`Generated on: ${new Date().toLocaleDateString()}`, { align: "center" })
+
+      if (reportData.dateRange) {
+        doc.text(`Period: ${reportData.dateRange.start} to ${reportData.dateRange.end}`, { align: "center" })
+      }
+
+      // Add a line separator
+      doc.moveDown(1)
+      doc.strokeColor("#e5e7eb").lineWidth(1).moveTo(50, doc.y).lineTo(545, doc.y).stroke()
+      doc.moveDown(1)
+
+      // Executive Summary (for combined reports)
+      if (reportData.type === "combined") {
+        checkPageSpace(150)
+        doc.fontSize(16).font("Helvetica-Bold").fillColor("#1f2937").text("Executive Summary")
+        doc.moveDown(0.5)
+
+        doc
+          .fontSize(11)
+          .font("Helvetica")
+          .fillColor("#374151")
+          .text(
+            reportData.executiveSummary?.overview ||
+              "Comprehensive analysis of the School Feeding Program performance across all stakeholder groups.",
+            { align: "justify" },
+          )
+
+        doc.moveDown(1)
+
+        // Key Metrics in a grid layout
+        const metrics = [
+          {
+            label: "Total Survey Responses",
+            value: reportData.qualitativeAnalysis?.summary?.totalResponses || 0,
+          },
+          {
+            label: "Total Meals Served",
+            value: reportData.quantitativeAnalysis?.metrics?.totalMealsServed || 0,
+          },
+          {
+            label: "Meal Efficiency",
+            value: `${reportData.quantitativeAnalysis?.metrics?.mealEfficiency?.toFixed(1) || 0}%`,
+          },
+          {
+            label: "Average Sentiment Score",
+            value: reportData.qualitativeAnalysis?.summary?.averageSentiment?.toFixed(2) || 0,
+          },
+        ]
+
+        // Create a simple metrics table
+        const startX = 50
+        const startY = doc.y
+        const boxWidth = 120
+        const boxHeight = 60
+
+        metrics.forEach((metric, index) => {
+          const x = startX + (index % 2) * (boxWidth + 20)
+          const y = startY + Math.floor(index / 2) * (boxHeight + 10)
+
+          // Draw box border
+          doc.rect(x, y, boxWidth, boxHeight).stroke("#e5e7eb")
+
+          // Add metric value
+          doc
+            .fontSize(18)
+            .font("Helvetica-Bold")
+            .fillColor("#1f2937")
+            .text(metric.value.toString(), x + 10, y + 15, {
+              width: boxWidth - 20,
+              align: "center",
+            })
+
+          // Add metric label
+          doc
+            .fontSize(9)
+            .font("Helvetica")
+            .fillColor("#6b7280")
+            .text(metric.label, x + 10, y + 40, {
+              width: boxWidth - 20,
+              align: "center",
+            })
+        })
+
+        doc.y = startY + 140
+        doc.moveDown(1)
+      }
+
+      // Survey Responses Analysis
+      checkPageSpace(100)
+      doc.fontSize(16).font("Helvetica-Bold").fillColor("#1f2937").text("Survey Responses Analysis")
+      doc.moveDown(0.5)
+
+      if (reportData.detailedResponses && reportData.detailedResponses.length > 0) {
+        // Table headers
+        const tableTop = doc.y
+        const tableHeaders = ["Respondent", "Role", "School", "Date", "Sentiment"]
+        const columnWidths = [100, 80, 120, 80, 80]
+        let currentX = 50
+
+        // Draw table headers
+        doc.fontSize(10).font("Helvetica-Bold").fillColor("#374151")
+        tableHeaders.forEach((header, index) => {
+          doc.text(header, currentX, tableTop, { width: columnWidths[index], align: "left" })
+          currentX += columnWidths[index]
+        })
+
+        doc.moveDown(0.5)
+        let currentY = doc.y
+
+        // Draw header line
+        doc.strokeColor("#d1d5db").lineWidth(1).moveTo(50, currentY).lineTo(545, currentY).stroke()
+        currentY += 5
+
+        // Table rows (limit to first 20 responses to fit on page)
+        const responsesToShow = reportData.detailedResponses.slice(0, 20)
+        doc.fontSize(9).font("Helvetica").fillColor("#4b5563")
+
+        responsesToShow.forEach((response, index) => {
+          checkPageSpace(20)
+          currentY = doc.y
+          currentX = 50
+
+          const rowData = [
+            response.respondent?.name || "Anonymous",
+            response.respondent?.role || "Unknown",
+            response.respondent?.school || "Unknown",
+            response.submittedAt ? new Date(response.submittedAt).toLocaleDateString() : "N/A",
+            response.sentimentCategory || "Neutral",
+          ]
+
+          rowData.forEach((data, colIndex) => {
+            doc.text(data.toString(), currentX, currentY, {
+              width: columnWidths[colIndex] - 5,
+              align: "left",
+              ellipsis: true,
+            })
+            currentX += columnWidths[colIndex]
+          })
+
+          doc.moveDown(0.3)
+
+          // Add subtle row separator
+          if (index % 2 === 0) {
+            doc
+              .rect(50, currentY - 2, 495, 15)
+              .fillColor("#f9fafb")
+              .fill()
+            doc.fillColor("#4b5563") // Reset text color
+          }
+        })
+
+        if (reportData.detailedResponses.length > 20) {
+          doc.moveDown(0.5)
+          doc
+            .fontSize(9)
+            .font("Helvetica-Oblique")
+            .fillColor("#6b7280")
+            .text(`Showing first 20 of ${reportData.detailedResponses.length} responses`)
+        }
+      } else {
+        doc.fontSize(11).font("Helvetica").fillColor("#6b7280").text("No survey responses available for this period.")
+      }
+
+      doc.moveDown(2)
+
+      // Key Themes Analysis
+      if (reportData.thematicAnalysis) {
+        checkPageSpace(100)
+        doc.fontSize(16).font("Helvetica-Bold").fillColor("#1f2937").text("Key Themes Analysis")
+        doc.moveDown(0.5)
+
+        Object.entries(reportData.thematicAnalysis).forEach(([theme, data]) => {
+          if (data.count > 0) {
+            checkPageSpace(80)
+            doc
+              .fontSize(12)
+              .font("Helvetica-Bold")
+              .fillColor("#2563eb")
+              .text(theme.charAt(0).toUpperCase() + theme.slice(1))
+
+            doc
+              .fontSize(10)
+              .font("Helvetica")
+              .fillColor("#4b5563")
+              .text(`Mentions: ${data.count} | Average Sentiment: ${data.avgSentiment?.toFixed(2) || 0}`)
+
+            if (data.examples && data.examples.length > 0) {
+              doc.moveDown(0.3)
+              doc
+                .fontSize(9)
+                .font("Helvetica-Oblique")
+                .fillColor("#6b7280")
+                .text(`Example: "${data.examples[0].answer}" - ${data.examples[0].user} (${data.examples[0].role})`, {
+                  indent: 20,
+                })
+            }
+            doc.moveDown(0.8)
+          }
+        })
+      }
+
+      // Recommendations
+      if (reportData.recommendations && reportData.recommendations.length > 0) {
+        checkPageSpace(100)
+        doc.fontSize(16).font("Helvetica-Bold").fillColor("#1f2937").text("Recommendations")
+        doc.moveDown(0.5)
+
+        reportData.recommendations.forEach((rec, index) => {
+          checkPageSpace(80)
+          doc
+            .fontSize(12)
+            .font("Helvetica-Bold")
+            .fillColor("#2563eb")
+            .text(`${index + 1}. ${rec.recommendation}`)
+
+          doc
+            .fontSize(10)
+            .font("Helvetica")
+            .fillColor("#4b5563")
+            .text(`Priority: ${rec.priority} | Category: ${rec.category}`)
+
+          doc.moveDown(0.2)
+          doc.fontSize(10).font("Helvetica").fillColor("#374151").text(`Expected Impact: ${rec.expectedImpact}`)
+
+          doc.moveDown(0.2)
+          doc.fontSize(9).font("Helvetica-Oblique").fillColor("#6b7280").text(`Data Source: ${rec.dataSource}`)
+
+          doc.moveDown(1)
+        })
+      }
+
+      // Footer
+      const pageCount = doc.bufferedPageRange().count
+      for (let i = 0; i < pageCount; i++) {
+        doc.switchToPage(i)
+        doc
+          .fontSize(8)
+          .font("Helvetica")
+          .fillColor("#9ca3af")
+          .text("School Feeding Program Analytics Report - Confidential", 50, doc.page.height - 30, { align: "center" })
+        doc.text(`Page ${i + 1} of ${pageCount}`, 50, doc.page.height - 20, { align: "center" })
+      }
+
+      // Finalize the PDF
+      doc.end()
+    } catch (error) {
+      reject(error)
+    }
+  })
+}
+
+// Generate and download PDF report - FIXED with PDFKit
+app.get("/api/admin/reports/download/:type", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { type } = req.params
+    const { startDate, endDate, role } = req.query
+
+    console.log(`Generating ${type} report for role: ${role || "all"}`)
+
+    const dateRange = startDate && endDate ? { start: startDate, end: endDate } : null
+    const filters = role ? { role } : {}
+
+    let report
+    switch (type) {
+      case "qualitative":
+        report = await reportGenerator.generateQualitativeReport(dateRange, filters)
+        break
+      case "quantitative":
+        report = await reportGenerator.generateQuantitativeReport(dateRange, filters)
+        break
+      case "combined":
+        report = await reportGenerator.generateCombinedReport(dateRange, filters)
+        break
+      default:
+        return res.status(400).json({
+          success: false,
+          message: "Invalid report type",
+        })
+    }
+
+    // Add metadata for PDF generation
+    report.title = `${type.charAt(0).toUpperCase() + type.slice(1)} Report - School Feeding Program`
+    report.type = type
+    report.dateRange = dateRange
+
+    console.log("Report generated, creating PDF...")
+
+    // Generate PDF using PDFKit
+    const pdfBuffer = await generatePDFReport(report)
+
+    console.log(`PDF generated successfully, size: ${pdfBuffer.length} bytes`)
+
+    // Save report to database
+    try {
+      const reportId = await reportGenerator.saveReport(report, req.session.user.id)
+      console.log(`Report saved to database with ID: ${reportId}`)
+    } catch (saveError) {
+      console.error("Error saving report to database:", saveError)
+      // Continue with PDF download even if database save fails
+    }
+
+    // Set proper headers for PDF download
+    const filename = `${type}-report-${role || "all"}-${Date.now()}.pdf`
+    res.setHeader("Content-Type", "application/pdf")
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`)
+    res.setHeader("Content-Length", pdfBuffer.length)
+    res.setHeader("Cache-Control", "no-cache")
+
+    // Send the PDF
+    res.send(pdfBuffer)
+    console.log("PDF sent successfully")
   } catch (error) {
-    console.error('Error fetching all survey questions:', error);
+    console.error("Error generating PDF report:", error)
     return res.status(500).json({
       success: false,
-      message: 'Failed to fetch survey questions',
-      error: error.message
-    });
+      message: "Failed to generate PDF report",
+      error: error.message,
+    })
   }
-});
+})
 
-// Default error handler
+// Error handling middleware
 app.use((err, req, res, next) => {
-  console.error('Server error:', err);
-  res.status(500).json({ 
-    success: false, 
-    message: 'Internal server error' 
-  });
-});
+  console.error("Unhandled error:", err)
+  res.status(500).json({
+    success: false,
+    message: err.message || "Internal server error",
+  })
+})
 
-// Start the server
-app.listen(process.env.PORT, async () => {
-  await Connection();
-  console.log(`Server is running on port: ${process.env.PORT}`);
-});
+// Initialize database and start server
+const initializeServer = async () => {
+  try {
+    await initializeTables()
+    await migrateHardcodedQuestions()
+
+    const PORT = process.env.PORT || 5000
+    server.listen(PORT, () => {
+      console.log(`Enhanced server running on port: ${PORT}`)
+      console.log("Real-time analytics and PDF reporting system initialized")
+      console.log("Using PDFKit for PDF generation")
+    })
+  } catch (error) {
+    console.error("Failed to initialize server:", error)
+    process.exit(1)
+  }
+}
+
+initializeServer()
+
+module.exports = { app, server, io }
